@@ -858,6 +858,96 @@ async def test_same_topic(
     assert issue_registry.async_get_issue("tasmota", issue_id) is None
 
 
+@pytest.mark.usefixtures("mqtt_mock", "setup_tasmota")
+async def test_same_topic_device_removed_by_user(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test a device sharing a topic is unblocked when the other one is removed."""
+    assert await async_setup_component(hass, "config", {})
+    config_entry_id = hass.config_entries.async_entries("tasmota")[0].entry_id
+    configs = [copy.deepcopy(DEFAULT_CONFIG), copy.deepcopy(DEFAULT_CONFIG)]
+    configs[0]["rl"][0] = 1
+    configs[0]["mac"] = "000000000001"
+    configs[1]["mac"] = "000000000002"
+
+    for config in configs:
+        async_fire_mqtt_message(
+            hass,
+            f"{DEFAULT_PREFIX}/{config['mac']}/config",
+            json.dumps(config),
+        )
+    await hass.async_block_till_done()
+
+    issue_id = "topic_duplicated_tasmota_49A3BC/cmnd/"
+    assert issue_registry.async_get_issue("tasmota", issue_id) is not None
+
+    # The broker does not echo the cleared retained config back in tests, and the
+    # library drops the echo for a removed device, so HA must forget it itself
+    device_entry = device_registry.async_get_device_by_connection(
+        (dr.CONNECTION_NETWORK_MAC, configs[0]["mac"]), config_entry_id
+    )
+    await remove_device(hass, hass_ws_client, device_entry.id)
+    await hass.async_block_till_done()
+
+    assert issue_registry.async_get_issue("tasmota", issue_id) is None
+
+    # The remaining device adds a relay and publishes its config again
+    configs[1]["rl"][0] = 1
+    async_fire_mqtt_message(
+        hass,
+        f"{DEFAULT_PREFIX}/{configs[1]['mac']}/config",
+        json.dumps(configs[1]),
+    )
+    await hass.async_block_till_done()
+
+    device_entry = device_registry.async_get_device_by_connection(
+        (dr.CONNECTION_NETWORK_MAC, configs[1]["mac"]), config_entry_id
+    )
+    assert len(er.async_entries_for_device(entity_registry, device_entry.id, True)) == 1
+    assert issue_registry.async_get_issue("tasmota", issue_id) is None
+
+
+@pytest.mark.usefixtures("mqtt_mock", "setup_tasmota")
+async def test_discovery_after_device_cleared_config(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test discovering a device after another device cleared its config."""
+    config_entry_id = hass.config_entries.async_entries("tasmota")[0].entry_id
+    configs = [copy.deepcopy(DEFAULT_CONFIG), copy.deepcopy(DEFAULT_CONFIG)]
+    configs[0]["mac"] = "000000000001"
+    configs[1]["mac"] = "000000000002"
+    configs[1]["t"] = "unique_topic"
+    configs[1]["rl"][0] = 1
+
+    async_fire_mqtt_message(
+        hass,
+        f"{DEFAULT_PREFIX}/{configs[0]['mac']}/config",
+        json.dumps(configs[0]),
+    )
+    await hass.async_block_till_done()
+    # The device clears its own retained config, e.g. after SetOption19 1
+    async_fire_mqtt_message(hass, f"{DEFAULT_PREFIX}/{configs[0]['mac']}/config", "")
+    await hass.async_block_till_done()
+
+    async_fire_mqtt_message(
+        hass,
+        f"{DEFAULT_PREFIX}/{configs[1]['mac']}/config",
+        json.dumps(configs[1]),
+    )
+    await hass.async_block_till_done()
+
+    device_entry = device_registry.async_get_device_by_connection(
+        (dr.CONNECTION_NETWORK_MAC, configs[1]["mac"]), config_entry_id
+    )
+    assert len(er.async_entries_for_device(entity_registry, device_entry.id, True)) == 1
+
+
 async def test_topic_no_prefix(
     hass: HomeAssistant,
     mqtt_mock: MqttMockHAClient,
@@ -924,3 +1014,35 @@ async def test_topic_no_prefix(
 
     # Verify the repairs issue has been removed
     assert ("tasmota", issue_id) not in issue_registry.issues
+
+
+@pytest.mark.usefixtures("mqtt_mock", "setup_tasmota")
+async def test_topic_no_prefix_device_removed_by_user(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    device_registry: dr.DeviceRegistry,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test the topic prefix issue is removed with the device."""
+    assert await async_setup_component(hass, "config", {})
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["ft"] = "%topic%/blah/"
+
+    async_fire_mqtt_message(
+        hass,
+        f"{DEFAULT_PREFIX}/{config['mac']}/config",
+        json.dumps(config),
+    )
+    await hass.async_block_till_done()
+
+    issue_id = "topic_no_prefix_00000049A3BC"
+    assert issue_registry.async_get_issue("tasmota", issue_id) is not None
+
+    device_entry = device_registry.async_get_device_by_connection(
+        (dr.CONNECTION_NETWORK_MAC, config["mac"]),
+        hass.config_entries.async_entries("tasmota")[0].entry_id,
+    )
+    await remove_device(hass, hass_ws_client, device_entry.id)
+    await hass.async_block_till_done()
+
+    assert issue_registry.async_get_issue("tasmota", issue_id) is None

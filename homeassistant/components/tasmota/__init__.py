@@ -168,5 +168,6 @@ async def async_remove_config_entry_device(
         await tasmota_discovery.clear_discovery_topic(
             mac, config_entry.data[CONF_DISCOVERY_PREFIX]
         )
+        discovery.async_forget_device(hass, mac, config_entry.entry_id)
 
     return True

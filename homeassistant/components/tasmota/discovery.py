@@ -22,7 +22,7 @@ from hatasmota.utils import get_topic_command, get_topic_stat
 
 from homeassistant.components import sensor
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import (
     device_registry as dr,
     entity_registry as er,
@@ -123,7 +123,51 @@ class DuplicatedTopicIssueData(TypedDict):
     topic: str
 
 
-async def async_start(  # noqa: C901
+@callback
+def _async_clear_duplicated_topic_issues(
+    hass: HomeAssistant,
+    mac: str,
+    command_topic: str | None,
+    config_entry_id: str,
+) -> None:
+    """Clear or update duplicated topic issues a device is no longer part of."""
+    issue_reg = ir.async_get(hass)
+    tasmota_issues = [
+        issue for key, issue in issue_reg.issues.items() if key[0] == DOMAIN
+    ]
+    for issue in tasmota_issues:
+        if issue.data and issue.data["key"] == "topic_duplicated":
+            issue_data: DuplicatedTopicIssueData = cast(
+                DuplicatedTopicIssueData, issue.data
+            )
+            macs = issue_data["mac"].split()
+            if mac not in macs:
+                continue
+            if command_topic == issue_data["topic"]:
+                continue
+            if len(macs) > 2:
+                # This device is no longer duplicated, update the issue
+                warn_if_topic_duplicated(
+                    hass, issue_data["topic"], None, {}, config_entry_id
+                )
+                continue
+            ir.async_delete_issue(hass, DOMAIN, issue.issue_id)
+
+
+@callback
+def async_forget_device(hass: HomeAssistant, mac: str, config_entry_id: str) -> None:
+    """Forget the discovery data of a device the user removed.
+
+    The library drops the echo of the cleared retained config, so the device is
+    never discovered again with an empty payload.
+    """
+    mac = mac.replace(":", "").upper()
+    hass.data[DISCOVERY_DATA].pop(mac, None)
+    ir.async_delete_issue(hass, DOMAIN, f"topic_no_prefix_{mac}")
+    _async_clear_duplicated_topic_issues(hass, mac, None, config_entry_id)
+
+
+async def async_start(
     hass: HomeAssistant,
     discovery_topic: str,
     config_entry: ConfigEntry,
@@ -192,7 +236,10 @@ async def async_start(  # noqa: C901
         tasmota_device_config = tasmota_get_device_config(payload)
         await setup_device(tasmota_device_config, mac)
 
-        hass.data[DISCOVERY_DATA][mac] = payload
+        if payload:
+            hass.data[DISCOVERY_DATA][mac] = payload
+        else:
+            hass.data[DISCOVERY_DATA].pop(mac, None)
 
         add_entities = True
 
@@ -226,28 +273,9 @@ async def async_start(  # noqa: C901
         else:
             ir.async_delete_issue(hass, DOMAIN, issue_id)
 
-        # Clear previous issues caused by duplicated topic
-        issue_reg = ir.async_get(hass)
-        tasmota_issues = [
-            issue for key, issue in issue_reg.issues.items() if key[0] == DOMAIN
-        ]
-        for issue in tasmota_issues:
-            if issue.data and issue.data["key"] == "topic_duplicated":
-                issue_data: DuplicatedTopicIssueData = cast(
-                    DuplicatedTopicIssueData, issue.data
-                )
-                macs = issue_data["mac"].split()
-                if mac not in macs:
-                    continue
-                if payload and command_topic == issue_data["topic"]:
-                    continue
-                if len(macs) > 2:
-                    # This device is no longer duplicated, update the issue
-                    warn_if_topic_duplicated(
-                        hass, issue_data["topic"], None, {}, config_entry.entry_id
-                    )
-                    continue
-                ir.async_delete_issue(hass, DOMAIN, issue.issue_id)
+        _async_clear_duplicated_topic_issues(
+            hass, mac, command_topic, config_entry.entry_id
+        )
 
         if not payload:
             return
